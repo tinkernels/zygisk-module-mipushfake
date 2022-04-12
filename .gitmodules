@@ -1,3 +1,7 @@
 [submodule "libcxx"]
 	path = module/jni/libcxx
 	url = https://github.com/topjohnwu/libcxx.git
+[submodule "module/jni/bhook"]
+	path = module/jni/bhook
+	url = https://github.com/bytedance/bhook.git
+	branch = main
