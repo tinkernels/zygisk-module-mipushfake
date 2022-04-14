@@ -2,12 +2,14 @@ LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
 LOCAL_MODULE := mipushfake
-LOCAL_SRC_FILES := example.cpp
-LOCAL_STATIC_LIBRARIES := libcxx
+LOCAL_SRC_FILES := mipushfake.cpp
+LOCAL_STATIC_LIBRARIES := libcxx libbhook
 LOCAL_LDLIBS := -llog
 include $(BUILD_SHARED_LIBRARY)
 
 include jni/libcxx/Android.mk
+
+include jni/Android-bhook.mk
 
 # If you do not want to use libc++, link to system stdc++
 # so that you can at least call the new operator in your code

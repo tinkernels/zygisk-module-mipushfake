@@ -12,9 +12,11 @@
 #include <fstream>
 #include <map>
 #include <sys/system_properties.h>
+#include <ctime>
 
 #include "zygisk.hpp"
 #include "util.h"
+#include "bytehook.h"
 
 using zygisk::Api;
 using zygisk::AppSpecializeArgs;
@@ -24,12 +26,10 @@ using zygisk::ServerSpecializeArgs;
 #define LOG_INFO_MPF(...) __android_log_print(ANDROID_LOG_INFO, "MiPushFake", __VA_ARGS__)
 #define LOG_WARN_MPF(...) __android_log_print(ANDROID_LOG_WARN, "MiPushFake", __VA_ARGS__)
 #define LOG_ERROR_MPF(...) __android_log_print(ANDROID_LOG_ERROR, "MiPushFake", __VA_ARGS__)
-#define INOTIFY_EVENT_BUF_LEN (10 * (sizeof(struct inotify_event) + PATH_MAX + 1))
+#define LOG_BYTE_HOOK(fmt, ...) __android_log_print(ANDROID_LOG_DEBUG, "ByteHook", fmt, ##__VA_ARGS__)
 
 static std::vector<std::string> packages_2_work;
-static std::shared_mutex packages_2_work_rw_mutex;
-static bool watcher_initialized = false;
-const static std::string conf_file_dir = "/data/adb/mi-push-fake";
+static long time_next_read_packages_2_work = 0;
 const static std::string conf_file_path = "/data/adb/mi-push-fake/packages.txt";
 // properties to hack.
 const static char *brand_hack = "Xiaomi";
@@ -56,138 +56,82 @@ const static std::map<std::string, std::string> props_4_hack{
 };
 
 // callback func for __system_property_read_callback
-using sys_prop_read_callback_param_callback_func =
-void(void *cookie,
-     const char *name,
-     const char *value,
-     uint32_t serial);
+typedef void (*spr_param_cb_t)(void *cookie,
+                               const char *name,
+                               const char *value,
+                               uint32_t serial);
+
 // __system_property_read_callback
-using sys_prop_read_callback_func =
-void(const prop_info *pi,
-     sys_prop_read_callback_param_callback_func *callback,
-     void *cookie);
-// __system_property_find
-using sys_prop_find_func = prop_info *(const char *name);
+typedef void (*__system_property_read_callback_t)(const prop_info *pi,
+                                                  spr_param_cb_t *callback,
+                                                  void *cookie);
+
 // __system_property_get
-using sys_prop_get_func = int(const char *key, char *value);
+typedef int (*__system_property_get_t)(const char *name, char *value);
 
-// callback parameter for __system_property_read_callback
-thread_local sys_prop_read_callback_param_callback_func *cb_param_4_sys_prop_read_cb_orig = nullptr;
+#define MPF_BHOOK_DEF(fn)                                                                                     \
+  static fn##_t fn##_prev = nullptr;                                                                         \
+  static bytehook_stub_t fn##_stub = nullptr;                                                                \
+  static void fn##_hooked_callback(bytehook_stub_t task_stub, int status_code, const char *caller_path_name, \
+                                   const char *sym_name, void *new_func, void *prev_func, void *arg) {       \
+    if (BYTEHOOK_STATUS_CODE_ORIG_ADDR == status_code) {                                                     \
+      fn##_prev = (fn##_t)prev_func;                                                                         \
+      LOG_BYTE_HOOK(">>>>> save original address: %lu", (unsigned long)prev_func);                           \
+    } else {                                                                                                 \
+      LOG_BYTE_HOOK(">>>>> hooked. stub: %lu, status: %d, caller_path_name: %s, sym_name: %s, new_func: %lu, prev_func: %lu, arg: %lu", \
+          (unsigned long)task_stub, status_code, caller_path_name, sym_name, (unsigned long)new_func,        \
+          (unsigned long)prev_func, (unsigned long)arg);                                                     \
+    }                                                                                                        \
+  }
 
-static void cb_param_4_sys_prop_read_cb_new(void *cookie, const char *name, const char *value,
-                                            uint32_t serial) {
-    if (!cb_param_4_sys_prop_read_cb_orig){
-        LOG_WARN_MPF("not found original __system_property_read_callback");
+MPF_BHOOK_DEF(__system_property_read_callback)
+
+MPF_BHOOK_DEF(__system_property_get)
+
+thread_local spr_param_cb_t spr_param_cb_prev = nullptr;
+
+static void spr_param_cb_new(void *cookie, const char *name, const char *value, uint32_t serial) {
+    if (spr_param_cb_prev == nullptr) {
+        LOG_ERROR_MPF("spr_param_cb_new previous function is null");
+    }
+    auto search_ = props_4_hack.find(name);
+    if (search_ != props_4_hack.end()) {
+        LOG_DEBUG_MPF("spr_param_cb_new: [%s] -> [%s]", name,
+                     search_->second.c_str());
+        return spr_param_cb_prev(cookie, name, search_->second.c_str(), serial);
+    }
+    LOG_DEBUG_MPF("spr_param_cb_new call prev: [%s] -> [%s]", name,
+                 search_->second.c_str());
+    spr_param_cb_prev(cookie, name, value, serial);
+}
+
+static void system_property_read_callback_new(const prop_info *pi,
+                                              spr_param_cb_t callback,
+                                              void *cookie) {
+    BYTEHOOK_STACK_SCOPE();
+    if (pi == nullptr) {
+        LOG_DEBUG_MPF("system_property_read_callback_new prop_info is null");
         return;
     }
-
-//    auto search_ = props_4_hack.find(name);
-//    if (search_ != props_4_hack.end()) {
-//        LOG_INFO_MPF("hack __system_property_read_callback: [%s]=[%s] -> [%s]", name, value,
-//                     search_->second.c_str());
-//        cb_param_4_sys_prop_read_cb_orig(cookie, name, search_->second.c_str(), serial);
-//    } else {
-        LOG_INFO_MPF("skip hack __system_property_read_callback: [%s]=[%s]", name, value);
-        cb_param_4_sys_prop_read_cb_orig(cookie, name, value, serial);
-//        return;
-//    }
+    spr_param_cb_prev = callback;
+    LOG_DEBUG_MPF("system_property_read_callback_new call prev: prop_info[%lu] cookie[%lu]",
+                 (unsigned long) pi, (unsigned long) cookie);
+    BYTEHOOK_CALL_PREV(system_property_read_callback_new, pi, spr_param_cb_new, cookie);
 }
 
-static sys_prop_read_callback_func *f_sys_prop_read_callback_orig = nullptr;
-
-static void f_sys_prop_read_callback_new(const prop_info *pi,
-                                         sys_prop_read_callback_param_callback_func *callback,
-                                         void *cookie) {
-    cb_param_4_sys_prop_read_cb_orig = callback;
-    if (f_sys_prop_read_callback_orig) {
-        f_sys_prop_read_callback_orig(pi, cb_param_4_sys_prop_read_cb_new, cookie);
+static int system_property_get_new(const char *name, char *value) {
+    BYTEHOOK_STACK_SCOPE();
+    auto search_ = props_4_hack.find(name);
+    if (search_ != props_4_hack.end()) {
+        strcpy(value, search_->second.c_str());
+        LOG_DEBUG_MPF("system_property_get_new: [%s] -> [%s]", name, value);
+        return 1;
     }
-}
-
-static sys_prop_find_func *f_sys_prop_find_orig = nullptr;
-
-static prop_info *f_sys_prop_find_new(const char *name) {
-//    auto search_ = props_4_hack.find(name);
-//    if (search_ != props_4_hack.end()) {
-//        LOG_INFO_MPF("hack __system_property_find");
-//        return reinterpret_cast<prop_info *>((void *) name);
-//    } else if (f_sys_prop_find_orig) {
-    LOG_INFO_MPF("skip hack __system_property_find");
-    return f_sys_prop_find_orig(name);
-//    } else {
-//        LOG_INFO_MPF("skip hack __system_property_find and orig func because of nullptr");
-//        return nullptr;
-//    }
-}
-
-static sys_prop_get_func *f_sys_prop_get_orig = nullptr;
-
-static int f_sys_prop_get_new(const char *name, char *value) {
-    if (f_sys_prop_get_orig == nullptr) {
-        LOG_WARN_MPF("not found original __system_property_get");
-        return 0;
-    }
-//    auto search_ = props_4_hack.find(name);
-//    if (search_ != props_4_hack.end()) {
-//        memset(value, 0, strlen(value));
-//        strcpy(value, search_->second.c_str());
-//        LOG_INFO_MPF("hack __system_property_get: [%s] -> [%s]", name, search_->second.c_str());
-//        return (int) strlen(value);
-//    } else {
-    int ret_ = f_sys_prop_get_orig(name, value);
-    LOG_INFO_MPF("skip hack __system_property_get: [%s] -> [%s]", name, value);
-    return ret_;
-//    }
-}
-
-static void display_inotify_event(struct inotify_event *event) {
-    char buf_[4096] = {};
-
-    sprintf(buf_, "wd=%d;", event->wd);
-
-    if (event->cookie > 0) {
-        sprintf(buf_, "%s cookie=%d; mask=", std::string(buf_).c_str(), event->cookie);
-    }
-
-    auto event_mask_text_ = "";
-    if (event->mask & IN_ACCESS) {
-        event_mask_text_ = "IN_ACCESS";
-    } else if (event->mask & IN_ATTRIB) {
-        event_mask_text_ = "IN_ATTRIB";
-    } else if (event->mask & IN_CLOSE_NOWRITE) {
-        event_mask_text_ = "IN_CLOSE_NOWRITE";
-    } else if (event->mask & IN_CLOSE_WRITE) {
-        event_mask_text_ = "IN_CLOSE_WRITE ";
-    } else if (event->mask & IN_CREATE) {
-        event_mask_text_ = "IN_CREATE";
-    } else if (event->mask & IN_DELETE) {
-        event_mask_text_ = "IN_DELETE";
-    } else if (event->mask & IN_DELETE_SELF) {
-        event_mask_text_ = "IN_DELETE_SELF";
-    } else if (event->mask & IN_IGNORED) {
-        event_mask_text_ = "IN_IGNORED";
-    } else if (event->mask & IN_ISDIR) {
-        event_mask_text_ = "IN_ISDIR";
-    } else if (event->mask & IN_MODIFY) {
-        event_mask_text_ = "IN_MODIFY";
-    } else if (event->mask & IN_MOVE_SELF) {
-        event_mask_text_ = "IN_MOVE_SELF";
-    } else if (event->mask & IN_MOVED_FROM) {
-        event_mask_text_ = "IN_MOVED_FROM";
-    } else if (event->mask & IN_MOVED_TO) {
-        event_mask_text_ = "IN_MOVED_TO";
-    } else if (event->mask & IN_OPEN) {
-        event_mask_text_ = "IN_OPEN";
-    } else if (event->mask & IN_Q_OVERFLOW) {
-        event_mask_text_ = "IN_Q_OVERFLOW";
-    } else if (event->mask & IN_UNMOUNT) {
-        event_mask_text_ = "IN_UNMOUNT";
-    }
-    LOG_INFO_MPF("file notify event %s%s\n", std::string(buf_).c_str(), event_mask_text_);
+    LOG_DEBUG_MPF("system_property_get_new call prev: [%s] -> [%s]", name, value);
+    return BYTEHOOK_CALL_PREV(system_property_get_new, name, value);
 }
 
 static void read_packages_2_work(const std::string &file) {
-    packages_2_work_rw_mutex.lock();
     packages_2_work.clear();
     std::ifstream i_file_(file);
     std::string line_;
@@ -199,51 +143,8 @@ static void read_packages_2_work(const std::string &file) {
         packages_2_work.push_back(line_);
     }
     for (const auto &p: packages_2_work) {
-        LOG_INFO_MPF("mi push work package: [%s]\n", p.c_str());
+        LOG_INFO_MPF("mi push work package: [%s]", p.c_str());
     }
-    packages_2_work_rw_mutex.unlock();
-}
-
-static void watch_conf_file(const std::string &file) {
-    auto ntf_fd_ = inotify_init();
-    if (ntf_fd_ < 0) {
-        LOG_ERROR_MPF("file watcher init error\n");
-        goto end;
-    } else {
-        char buf_[INOTIFY_EVENT_BUF_LEN];
-        ssize_t num_read_;
-        struct inotify_event *event_;
-        auto watcher_fd_ = inotify_add_watch(ntf_fd_, file.c_str(), IN_ALL_EVENTS);
-        if (watcher_fd_ < 0) {
-            LOG_ERROR_MPF("file watcher add error\n");
-            goto end;
-        }
-#pragma clang diagnostic push
-#pragma ide diagnostic ignored "EndlessLoop"
-        for (;;) {
-            num_read_ = read(ntf_fd_, buf_, INOTIFY_EVENT_BUF_LEN);
-            if (num_read_ == 0) {
-                LOG_ERROR_MPF("read() from inotify fd returned 0!\n");
-                continue;
-            }
-
-            if (num_read_ == -1) {
-                continue;
-            }
-            for (char *p = buf_; p < buf_ + num_read_;) {
-                event_ = (struct inotify_event *) p;
-                display_inotify_event(event_);
-                if (event_->mask & IN_MODIFY) {
-                    // Reread packages config.
-                    read_packages_2_work(file);
-                }
-                p += sizeof(struct inotify_event) + event_->len;
-            }
-        }
-#pragma clang diagnostic pop
-    }
-    end:
-    LOG_ERROR_MPF("file watcher end\n");
 }
 
 class MiPushFakeModule : public zygisk::ModuleBase {
@@ -251,124 +152,130 @@ public:
     void onLoad(Api *pApi, JNIEnv *pEnv) override {
         this->api = pApi;
         this->env = pEnv;
-//        // Ensure conf file exists.
-//        std::filesystem::create_directory(conf_file_dir);
-//        // Create file if not exist.
-//        if (access(conf_file_path.c_str(), F_OK) == 0) {
-//            LOG_INFO_MPF("%s file exist\n", conf_file_path.c_str());
-//        } else {
-//            LOG_WARN_MPF("%s no such file, will create\n", conf_file_path.c_str());
-//            std::ofstream{conf_file_path};
-//            chmod(conf_file_path.c_str(), S_IRWXU | S_IRWXG | S_IRWXO);
-//        }
-//        if (access(conf_file_path.c_str(), F_OK) != 0) {
-//            return;
-//        }
+        LOG_INFO_MPF("module loaded");
     }
 
     void preAppSpecialize(AppSpecializeArgs *args) override {
-        if (access(conf_file_path.c_str(), F_OK) != 0) {
-            return;
-        }
         // Use JNI to fetch our process name
         const char *process = env->GetStringUTFChars(args->nice_name, nullptr);
-        preSpecialize(process);
+        pre_specialize(process);
         env->ReleaseStringUTFChars(args->nice_name, process);
     }
 
     void preServerSpecialize(ServerSpecializeArgs *args) override {
-        if (access(conf_file_path.c_str(), F_OK) != 0) {
-            return;
-        }
-        preSpecialize("system_server");
+        pre_specialize("system_server");
     }
 
     void postAppSpecialize([[maybe_unused]] const AppSpecializeArgs *args) override {
-//        const char *process = env->GetStringUTFChars(args->nice_name, nullptr);
-//        LOG_INFO_MPF("inject android.os.Build for %s ", process);
-//
-//        jclass build_class = this->env->FindClass("android/os/Build");
-//        if (build_class == nullptr) {
-//            LOG_WARN_MPF("failed to inject android.os.Build for %s due to build is null", process);
-//            this->env->ReleaseStringUTFChars(args->nice_name, process);
-//            return;
-//        }
-//
-//        jstring new_str = this->env->NewStringUTF(brand_hack);
-//
-//        jfieldID brand_id = this->env->GetStaticFieldID(build_class,
-//                                                        "BRAND",
-//                                                        "Ljava/lang/String;");
-//        if (brand_id != nullptr) {
-//            this->env->SetStaticObjectField(build_class, brand_id, new_str);
-//        }
-//
-//        jfieldID manufacturer_id = this->env->GetStaticFieldID(build_class,
-//                                                               "MANUFACTURER",
-//                                                               "Ljava/lang/String;");
-//        if (manufacturer_id != nullptr) {
-//            this->env->SetStaticObjectField(build_class, manufacturer_id, new_str);
-//        }
-//
-//        jfieldID product_id = this->env->GetStaticFieldID(build_class,
-//                                                          "PRODUCT",
-//                                                          "Ljava/lang/String;");
-//        if (product_id != nullptr) {
-//            this->env->SetStaticObjectField(build_class, product_id, new_str);
-//        }
-//
-//        if (this->env->ExceptionCheck()) {
-//            this->env->ExceptionClear();
-//        }
-//        this->env->DeleteLocalRef(new_str);
-//        this->env->ReleaseStringUTFChars(args->nice_name, process);
+        const char *process = env->GetStringUTFChars(args->nice_name, nullptr);
+        if (!this->IfManipulate) {
+            LOG_DEBUG_MPF("skip build info hijack for: [%s]", process);
+            env->ReleaseStringUTFChars(args->nice_name, process);
+            return;
+        }
+        LOG_INFO_MPF("inject android.os.Build for %s ", process);
+
+        jclass build_class = env->FindClass("android/os/Build");
+        if (build_class == nullptr) {
+            LOG_WARN_MPF("failed to inject android.os.Build for %s due to build is null", process);
+            return;
+        }
+
+        jstring new_brand = env->NewStringUTF("Xiaomi");
+        jstring new_product = env->NewStringUTF("Xiaomi");
+        jstring new_model = env->NewStringUTF("Mi 10");
+
+        jfieldID brand_id = env->GetStaticFieldID(build_class, "BRAND", "Ljava/lang/String;");
+        if (brand_id != nullptr) {
+            env->SetStaticObjectField(build_class, brand_id, new_brand);
+        }
+
+        jfieldID manufacturer_id = env->GetStaticFieldID(build_class, "MANUFACTURER", "Ljava/lang/String;");
+        if (manufacturer_id != nullptr) {
+            env->SetStaticObjectField(build_class, manufacturer_id, new_brand);
+        }
+
+        jfieldID product_id = env->GetStaticFieldID(build_class, "PRODUCT", "Ljava/lang/String;");
+        if (product_id != nullptr) {
+            env->SetStaticObjectField(build_class, product_id, new_product);
+        }
+
+        jfieldID device_id = env->GetStaticFieldID(build_class, "DEVICE", "Ljava/lang/String;");
+        if (device_id != nullptr) {
+            env->SetStaticObjectField(build_class, device_id, new_product);
+        }
+
+        jfieldID model_id = env->GetStaticFieldID(build_class, "MODEL", "Ljava/lang/String;");
+        if (model_id != nullptr) {
+            env->SetStaticObjectField(build_class, model_id, new_model);
+        }
+
+        if(env->ExceptionCheck())
+        {
+            env->ExceptionClear();
+        }
+
+        env->DeleteLocalRef(new_brand);
+        env->DeleteLocalRef(new_product);
+        env->DeleteLocalRef(new_model);
+
+        env->ReleaseStringUTFChars(args->nice_name, process);
     }
 
 private:
     Api *api{};
     JNIEnv *env{};
+    bool IfManipulate = false;
 
-    void preSpecialize(const char *process) {
-//        int match_ = 0;
-//        LOG_DEBUG_MPF("process=[%s]\n", process);
-//        int fd = api->connectCompanion();
-//        if (write(fd, process, strlen(process) + 1) <= 0) {
-//            LOG_WARN_MPF("write socket failed\n");
-//        }
-//        if (read(fd, &match_, sizeof(match_)) <= 0) {
-//            LOG_WARN_MPF("read socket failed\n");
-//        }
-//        close(fd);
-//        if (match_ < 0) {
-//            LOG_DEBUG_MPF("skip hook for [%s]\n", process);
-//            return;
-//        }
+    bool is_process_2_work(const char *process) {
+        int match_ = 0;
+        LOG_DEBUG_MPF("process=[%s]", process);
+        int fd = api->connectCompanion();
+        if (write(fd, process, strlen(process) + 1) <= 0) {
+            LOG_WARN_MPF("write socket failed");
+        }
+        if (read(fd, &match_, sizeof(match_)) <= 0) {
+            LOG_WARN_MPF("read socket failed");
+        }
+        close(fd);
+        LOG_DEBUG_MPF("process=[%s] to manipulate: %d", process, match_);
+        return match_ > 0;
+    }
+
+    void pre_specialize(const char *process) {
         LOG_INFO_MPF("Zygisk preSpecialize within [%s]", process);
-        api->pltHookRegister(".*", "__system_property_get",
-                             (void *) f_sys_prop_get_new,
-                             (void **) &f_sys_prop_get_orig);
-        api->pltHookRegister(".*", "__system_property_read_callback",
-                             (void *) f_sys_prop_read_callback_new,
-                             (void **) &f_sys_prop_read_callback_orig);
-        api->pltHookRegister(".*", "__system_property_find",
-                             (void *) f_sys_prop_find_new,
-                             (void **) &f_sys_prop_find_orig);
-        api->pltHookCommit();
+        bytehook_init(BYTEHOOK_MODE_AUTOMATIC, false);
+        if (is_process_2_work(process)) {
+            this->IfManipulate = true;
+            LOG_INFO_MPF("Will hook property functions");
+            auto hook_stub_ = bytehook_hook_all(nullptr, "__system_property_get",
+                                                (void *) system_property_get_new,
+                                                __system_property_get_hooked_callback, nullptr);
+            LOG_DEBUG_MPF("hook result __system_property_get stub: %ld",
+                          (unsigned long) hook_stub_);
+            hook_stub_ = bytehook_hook_all(nullptr, "__system_property_read_callback",
+                                           (void *) system_property_read_callback_new,
+                                           __system_property_read_callback_hooked_callback,
+                                           nullptr);
+            LOG_DEBUG_MPF("hook result __system_property_read_callback stub: %ld",
+                          (unsigned long) hook_stub_);
+
+        }
     }
 };
 
+static std::mutex conf_mutex;
 
 static void companion_handler(int fd) {
-    // Run file watcher at last.
-    packages_2_work_rw_mutex.lock();
-    if (!watcher_initialized) {
-        LOG_DEBUG_MPF("read packages_2_work");
+    if (access(conf_file_path.c_str(), F_OK) != 0) {
+        LOG_ERROR_MPF("can't access config file");
+        return;
+    }
+    std::lock_guard<std::mutex> lock(conf_mutex);
+    auto now_ts_ = std::time(nullptr);
+    if (now_ts_ > time_next_read_packages_2_work) {
         read_packages_2_work(conf_file_path);
-        watcher_initialized = true;
-        packages_2_work_rw_mutex.unlock();
-        std::thread conf_watch_th_(watch_conf_file, conf_file_path);
-    } else {
-        packages_2_work_rw_mutex.unlock();
+        time_next_read_packages_2_work = now_ts_ + 60; // reread after seconds.
     }
     char buff_[BUFSIZ];
     memset(buff_, 0, BUFSIZ);
@@ -376,19 +283,26 @@ static void companion_handler(int fd) {
         return;
     }
     auto package_ = std::string(buff_);
+    LOG_DEBUG_MPF("package [%s] for matching", package_.c_str());
     int match_ = 0;
-    packages_2_work_rw_mutex.lock_shared();
-    for (const auto &p: packages_2_work) {
+    for (auto &p: packages_2_work) {
+        trim(p);
+        trim(package_);
+        std::transform(p.begin(), p.end(), p.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
+        std::transform(package_.begin(), package_.end(), package_.begin(),
+                       [](unsigned char c){ return std::tolower(c); });
         if (strncmp(p.c_str(), package_.c_str(), strlen(p.c_str())) == 0) {
             match_ = 1;
+            LOG_DEBUG_MPF("package [%s] match %s", package_.c_str(), p.c_str());
         }
     }
-    packages_2_work_rw_mutex.unlock_shared();
-    LOG_DEBUG_MPF("package [%s] matching: %d", package_.c_str(), match_);
+    LOG_DEBUG_MPF("package [%s] match result: %d", package_.c_str(), match_);
     if (write(fd, &match_, sizeof(match_)) < sizeof(match_)) {
         LOG_ERROR_MPF("partial/failed write");
     }
 }
 
 REGISTER_ZYGISK_MODULE(MiPushFakeModule)
-//REGISTER_ZYGISK_COMPANION(companion_handler)
+
+REGISTER_ZYGISK_COMPANION(companion_handler)
